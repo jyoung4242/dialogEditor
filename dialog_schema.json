@@ -1,0 +1,188 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/schemas/dialogue-tree.json",
+  "title": "Dialogue Tree",
+  "description": "A branching dialogue structure composed of interconnected dialogue nodes.",
+  "type": "object",
+  "required": ["id", "startNodeId", "nodes"],
+  "additionalProperties": false,
+
+  "properties": {
+    "id": {
+      "$ref": "#/$defs/Identifier",
+      "description": "Unique identifier for the dialogue tree."
+    },
+
+    "startNodeId": {
+      "type": "string",
+      "description": "Identifier of the first node in the dialogue."
+    },
+
+    "nodes": {
+      "type": "object",
+      "description": "Collection of dialogue nodes keyed by node identifier.",
+      "additionalProperties": {
+        "$ref": "#/$defs/DialogueNode"
+      },
+      "minProperties": 1
+    }
+  },
+
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "A kebab-case identifier."
+    },
+
+    "FlagIdentifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "A kebab-case state flag identifier."
+    },
+
+    "DialogueNode": {
+      "type": "object",
+      "description": "A single dialogue entry within a conversation.",
+      "required": ["speaker", "text"],
+      "additionalProperties": false,
+
+      "properties": {
+        "speaker": {
+          "type": "string",
+          "description": "Display name associated with this dialogue node."
+        },
+
+        "portrait": {
+          "type": "string",
+          "description": "Optional portrait or avatar identifier associated with the speaker."
+        },
+
+        "text": {
+          "type": "string",
+          "description": "Content displayed to the user."
+        },
+
+        "choices": {
+          "type": "array",
+          "description": "Selectable responses available to the user.",
+          "items": {
+            "$ref": "#/$defs/DialogueChoice"
+          },
+          "minItems": 1
+        },
+
+        "autoNextNodeId": {
+          "type": ["string", "null"],
+          "description": "Identifier of the next node to navigate to automatically. Null indicates the dialogue should end."
+        },
+
+        "setsFlag": {
+          "$ref": "#/$defs/FlagIdentifier",
+          "description": "State flag applied when this node is entered."
+        }
+      },
+
+      "oneOf": [
+        {
+          "description": "Choice node",
+          "required": ["choices"],
+          "properties": {
+            "autoNextNodeId": {
+              "not": {}
+            }
+          }
+        },
+        {
+          "description": "Automatic transition node",
+          "required": ["autoNextNodeId"],
+          "properties": {
+            "choices": {
+              "not": {}
+            }
+          }
+        },
+        {
+          "description": "Terminal node",
+          "properties": {
+            "choices": {
+              "not": {}
+            },
+            "autoNextNodeId": {
+              "not": {}
+            }
+          }
+        }
+      ]
+    },
+
+    "DialogueChoice": {
+      "type": "object",
+      "description": "A selectable response that may trigger actions and navigate to another node.",
+      "required": ["label", "nextNodeId"],
+      "additionalProperties": false,
+
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Text displayed for the choice."
+        },
+
+        "nextNodeId": {
+          "type": ["string", "null"],
+          "description": "Identifier of the next node. Null indicates the dialogue should end."
+        },
+
+        "requiresFlag": {
+          "$ref": "#/$defs/FlagIdentifier",
+          "description": "Choice is available only when the specified flag is present."
+        },
+
+        "setsFlag": {
+          "$ref": "#/$defs/FlagIdentifier",
+          "description": "State flag applied when this choice is selected."
+        },
+
+        "startsTask": {
+          "$ref": "#/$defs/Identifier",
+          "description": "Application-defined task or event identifier triggered when this choice is selected."
+        },
+
+        "completesTask": {
+          "$ref": "#/$defs/Identifier",
+          "description": "Application-defined task or event identifier completed when this choice is selected."
+        }
+      }
+    }
+  },
+
+  "examples": [
+    {
+      "id": "example-conversation",
+      "startNodeId": "greeting",
+      "nodes": {
+        "greeting": {
+          "speaker": "Guide",
+          "portrait": "guide",
+          "text": "Welcome. How can I help you?",
+          "choices": [
+            {
+              "label": "Tell me more.",
+              "nextNodeId": "information"
+            },
+            {
+              "label": "Goodbye.",
+              "nextNodeId": null
+            }
+          ]
+        },
+        "information": {
+          "speaker": "Guide",
+          "portrait": "guide",
+          "text": "Here is some additional information.",
+          "autoNextNodeId": null
+        }
+      }
+    }
+  ]
+}
