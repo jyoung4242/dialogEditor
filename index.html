@@ -1,0 +1,1563 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Skyrelda Dialogue Tree Editor</title>
+    <!-- Tailwind CSS for modern styled UI -->
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <!-- React and ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <!-- Babel Standalone for live JSX translation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      body,
+      html,
+      #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background-color: #0f172a;
+        color: #e2e8f0;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          "Helvetica Neue",
+          Arial,
+          sans-serif;
+      }
+      /* Grid background effect for the canvas */
+      .graph-bg {
+        background-size: 40px 40px;
+        background-image:
+          linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+      }
+      /* Hide scrollbars but preserve functionality */
+      .no-scrollbar::-webkit-scrollbar {
+        display: none;
+      }
+      .no-scrollbar {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useRef, useMemo } = React;
+
+      // Default initial schema-conforming node graph state
+      const INITIAL_STATE = {
+        id: "new-conversation-id",
+        startNodeId: "start-node",
+        worldState: {
+          flags: ["met-npc", "has-item"],
+        },
+        nodes: {
+          "start-node": {
+            speaker: "Narrator",
+            portrait: "none",
+            text: "You approach a dusty terminal embedded within the ancient stone structures.",
+            x: 150,
+            y: 200,
+            choices: [
+              { label: "Examine the console.", nextNodeId: "examine-console" },
+              { label: "Walk away.", nextNodeId: null },
+            ],
+          },
+          "examine-console": {
+            speaker: "Terminal AI",
+            portrait: "terminal",
+            text: "SYSTEM REBOOT IN PROGRESS... Identify yourself, traveler.",
+            setsFlag: "met-npc",
+            x: 550,
+            y: 100,
+            conditions: [{ requiresFlag: "has-item", nextNodeId: "special-override" }],
+            choices: [{ label: "State your name.", nextNodeId: "success-node", setsFlag: "told-name" }],
+          },
+          "special-override": {
+            speaker: "Terminal AI",
+            portrait: "terminal",
+            text: "Artifact signature detected. Master override authorized.",
+            x: 550,
+            y: 400,
+            autoNextNodeId: "success-node",
+          },
+          "success-node": {
+            speaker: "Terminal AI",
+            portrait: "terminal",
+            text: "Access granted. Welcome to the core repository.",
+            x: 950,
+            y: 250,
+            autoNextNodeId: null,
+          },
+        },
+      };
+
+      function App() {
+        // Core States
+        const [treeId, setTreeId] = useState(INITIAL_STATE.id);
+        const [startNodeId, setStartNodeId] = useState(INITIAL_STATE.startNodeId);
+        const [nodes, setNodes] = useState(INITIAL_STATE.nodes);
+        const [flags, setFlags] = useState(INITIAL_STATE.worldState.flags);
+
+        // View & UI Management States
+        const [selectedNodeId, setSelectedNodeId] = useState("start-node");
+        const [zoom, setZoom] = useState(1);
+        const [pan, setPan] = useState({ x: 0, y: 0 });
+        const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
+        const [draggedNodeId, setDraggedNodeId] = useState(null);
+        const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+        const [errorMessage, setErrorMessage] = useState("");
+        const [searchQuery, setSearchQuery] = useState("");
+        const [playtestNodeId, setPlaytestNodeId] = useState(null);
+        const [playtestActiveFlags, setPlaytestActiveFlags] = useState([]);
+
+        const canvasRef = useRef(null);
+
+        // Kebab-case validation pattern matching the schema rules
+        const validateKebab = str => /^[a-z0-9]+(-[a-z0-9]+)*$/.test(str);
+
+        // Graph canvas dimensions config
+        const nodeWidth = 260;
+        const nodeHeight = 180;
+
+        // Compute lists of valid nodes and check for structural anomalies
+        const brokenLinks = useMemo(() => {
+          const broken = [];
+          Object.entries(nodes).forEach(([id, node]) => {
+            if (node.autoNextNodeId && !nodes[node.autoNextNodeId]) {
+              broken.push({ from: id, type: "autoNextNodeId", target: node.autoNextNodeId });
+            }
+            if (node.conditions) {
+              node.conditions.forEach((c, idx) => {
+                if (c.nextNodeId && !nodes[c.nextNodeId]) {
+                  broken.push({ from: id, type: `condition-${idx}`, target: c.nextNodeId });
+                }
+              });
+            }
+            if (node.choices) {
+              node.choices.forEach((choice, idx) => {
+                if (choice.nextNodeId && !nodes[choice.nextNodeId]) {
+                  broken.push({ from: id, type: `choice-${idx}`, target: choice.nextNodeId });
+                }
+              });
+            }
+          });
+          return broken;
+        }, [nodes]);
+
+        const unreachableNodes = useMemo(() => {
+          const visited = new Set();
+          const queue = [startNodeId];
+
+          while (queue.length > 0) {
+            const currentId = queue.shift();
+            if (!currentId || visited.has(currentId) || !nodes[currentId]) continue;
+            visited.add(currentId);
+
+            const node = nodes[currentId];
+            if (node.autoNextNodeId) queue.push(node.autoNextNodeId);
+            if (node.conditions) {
+              node.conditions.forEach(c => {
+                if (c.nextNodeId) queue.push(c.nextNodeId);
+              });
+            }
+            if (node.choices) {
+              node.choices.forEach(c => {
+                if (c.nextNodeId) queue.push(c.nextNodeId);
+              });
+            }
+          }
+
+          return Object.keys(nodes).filter(id => !visited.has(id));
+        }, [nodes, startNodeId]);
+
+        // Handlers: Node operations
+        const addNode = () => {
+          let baseId = "new-node";
+          let counter = 1;
+          while (nodes[`${baseId}-${counter}`]) {
+            counter++;
+          }
+          const newId = `${baseId}-${counter}`;
+
+          setNodes(prev => ({
+            ...prev,
+            [newId]: {
+              speaker: "Speaker",
+              portrait: "none",
+              text: "New dialogue beat entry details...",
+              x: 100 - pan.x,
+              y: 150 - pan.y,
+              choices: [{ label: "Continue", nextNodeId: null }],
+            },
+          }));
+          setSelectedNodeId(newId);
+        };
+
+        const deleteNode = idToDelete => {
+          if (Object.keys(nodes).length <= 1) {
+            alert("A story tree requires at least one active node.");
+            return;
+          }
+          if (confirm(`Are you sure you want to permanently delete node [${idToDelete}]? Links pointing here will break.`)) {
+            const updatedNodes = { ...nodes };
+            delete updatedNodes[idToDelete];
+            setNodes(updatedNodes);
+            if (selectedNodeId === idToDelete) {
+              setSelectedNodeId(Object.keys(updatedNodes)[0]);
+            }
+            if (startNodeId === idToDelete) {
+              setStartNodeId(Object.keys(updatedNodes)[0]);
+            }
+          }
+        };
+
+        const updateNodeProperty = (id, prop, val) => {
+          setNodes(prev => ({
+            ...prev,
+            [id]: { ...prev[id], [prop]: val },
+          }));
+        };
+
+        const changeNodeId = (oldId, newId) => {
+          if (oldId === newId) return;
+          if (!validateKebab(newId)) {
+            alert("ID format invalid! Please adhere strictly to kebab-case guidelines.");
+            return;
+          }
+          if (nodes[newId]) {
+            alert("Collision risk! A node already uses this unique ID allocation.");
+            return;
+          }
+
+          const updatedNodes = {};
+          Object.entries(nodes).forEach(([id, node]) => {
+            let newNodeData = { ...node };
+            if (newNodeData.autoNextNodeId === oldId) newNodeData.autoNextNodeId = newId;
+            if (newNodeData.conditions) {
+              newNodeData.conditions = newNodeData.conditions.map(c => (c.nextNodeId === oldId ? { ...c, nextNodeId: newId } : c));
+            }
+            if (newNodeData.choices) {
+              newNodeData.choices = newNodeData.choices.map(c => (c.nextNodeId === oldId ? { ...c, nextNodeId: newId } : c));
+            }
+
+            if (id === oldId) {
+              updatedNodes[newId] = newNodeData;
+            } else {
+              updatedNodes[id] = newNodeData;
+            }
+          });
+
+          setNodes(updatedNodes);
+          if (selectedNodeId === oldId) setSelectedNodeId(newId);
+          if (startNodeId === oldId) setStartNodeId(newId);
+        };
+
+        // Global State Flag adjustments
+        const addFlag = () => {
+          let name = prompt("Provide an unique flag identity key (kebab-case preferred):");
+          if (!name) return;
+          name = name.trim().toLowerCase();
+          if (!validateKebab(name)) {
+            alert("Flags must comply with standard lower-case alphanumeric kebab-case patterns.");
+            return;
+          }
+          if (flags.includes(name)) return;
+          setFlags([...flags, name]);
+        };
+
+        const removeFlag = targetFlag => {
+          setFlags(flags.filter(f => f !== targetFlag));
+        };
+
+        // Canvas Interaction Handling (Panning/Dragging)
+        const handleCanvasMouseDown = e => {
+          if (e.target.closest(".node-card") || e.target.closest("button") || e.target.closest("input")) return;
+          setIsDraggingCanvas(true);
+        };
+
+        const handleCanvasMouseMove = e => {
+          if (isDraggingCanvas) {
+            setPan(prev => ({ x: prev.x + e.movementX, y: prev.y + e.movementY }));
+          } else if (draggedNodeId && nodes[draggedNodeId]) {
+            const rect = canvasRef.current.getBoundingClientRect();
+            const clientX = e.clientX - rect.left;
+            const clientY = e.clientY - rect.top;
+
+            // Adjust position calculations mapped against zoom factors
+            const targetX = Math.round((clientX - pan.x) / zoom - dragOffset.x);
+            const targetY = Math.round((clientY - pan.y) / zoom - dragOffset.y);
+
+            setNodes(prev => ({
+              ...prev,
+              [draggedNodeId]: { ...prev[draggedNodeId], x: targetX, y: targetY },
+            }));
+          }
+        };
+
+        const handleCanvasMouseUp = () => {
+          setIsDraggingCanvas(false);
+          setDraggedNodeId(null);
+        };
+
+        const zoomIn = () => {
+          setZoom(prev => Math.min(1.5, prev + 0.1));
+        };
+
+        const zoomOut = () => {
+          setZoom(prev => Math.max(0.4, prev - 0.1));
+        };
+
+        const handleCanvasWheel = e => {
+          e.preventDefault();
+          if (e.deltaY < 0) {
+            zoomIn();
+          } else {
+            zoomOut();
+          }
+        };
+
+        const handleNodeDragStart = (e, id) => {
+          e.stopPropagation();
+          const rect = e.currentTarget.getBoundingClientRect();
+          const offsetComponentsX = (e.clientX - rect.left) / zoom;
+          const offsetComponentsY = (e.clientY - rect.top) / zoom;
+          setDraggedNodeId(id);
+          setDragOffset({ x: offsetComponentsX, y: offsetComponentsY });
+          setSelectedNodeId(id);
+        };
+
+        const buildExportPayload = () => {
+          const outputNodes = {};
+          Object.entries(nodes).forEach(([id, srcNode]) => {
+            const cleanNode = {
+              speaker: srcNode.speaker || "Unknown",
+              portrait: srcNode.portrait || "none",
+              text: srcNode.text || "",
+            };
+
+            if (srcNode.setsFlag) cleanNode.setsFlag = srcNode.setsFlag;
+            if (srcNode.conditions && srcNode.conditions.length > 0) {
+              cleanNode.conditions = srcNode.conditions.map(c => ({
+                requiresFlag: c.requiresFlag,
+                nextNodeId: c.nextNodeId,
+              }));
+            }
+
+            if (srcNode.choices && srcNode.choices.length > 0) {
+              cleanNode.choices = srcNode.choices.map(c => {
+                const choiceObj = { label: c.label, nextNodeId: c.nextNodeId };
+                if (c.requiresFlag) choiceObj.requiresFlag = c.requiresFlag;
+                if (c.setsFlag) choiceObj.setsFlag = c.setsFlag;
+                if (c.startsQuest) choiceObj.startsQuest = c.startsQuest;
+                if (c.completesQuest) choiceObj.completesQuest = c.completesQuest;
+                return choiceObj;
+              });
+            } else if (srcNode.hasOwnProperty("autoNextNodeId")) {
+              cleanNode.autoNextNodeId = srcNode.autoNextNodeId;
+            } else {
+              cleanNode.autoNextNodeId = null;
+            }
+
+            cleanNode.editorMetadata = {
+              x: Math.round(srcNode.x ?? 100),
+              y: Math.round(srcNode.y ?? 100),
+            };
+
+            outputNodes[id] = cleanNode;
+          });
+
+          return {
+            id: treeId,
+            startNodeId: startNodeId,
+            worldState: { flags: flags },
+            nodes: outputNodes,
+          };
+        };
+
+        // JSON Export Handler matching the structural specifications
+        const exportJSON = () => {
+          try {
+            const payload = buildExportPayload();
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
+            const dlAnchor = document.createElement("a");
+            dlAnchor.setAttribute("href", dataStr);
+            dlAnchor.setAttribute("download", `${treeId || "dialogue-tree"}.json`);
+            document.body.appendChild(dlAnchor);
+            dlAnchor.click();
+            dlAnchor.remove();
+            setErrorMessage("");
+          } catch (err) {
+            setErrorMessage(`Export sequence encountered structural difficulties: ${err.message}`);
+          }
+        };
+
+        const copyJSON = async () => {
+          try {
+            const payload = buildExportPayload();
+            const jsonText = JSON.stringify(payload, null, 2);
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(jsonText);
+            } else {
+              const tempTextArea = document.createElement("textarea");
+              tempTextArea.value = jsonText;
+              tempTextArea.setAttribute("readonly", "");
+              tempTextArea.style.position = "fixed";
+              tempTextArea.style.left = "-9999px";
+              document.body.appendChild(tempTextArea);
+              tempTextArea.select();
+              document.execCommand("copy");
+              tempTextArea.remove();
+            }
+
+            setErrorMessage("");
+          } catch (err) {
+            setErrorMessage(`Copy sequence encountered structural difficulties: ${err.message}`);
+          }
+        };
+        // JSON File Safe Parse Importer
+        const importJSON = e => {
+          const fileReader = new FileReader();
+          if (!e.target.files || e.target.files.length === 0) return;
+
+          fileReader.onload = event => {
+            try {
+              const data = JSON.parse(event.target.result);
+
+              if (!data.id || typeof data.id !== "string")
+                throw new Error("Missing structural asset property: 'id' key string verification.");
+              if (!data.startNodeId) throw new Error("File context missing operational property target configuration: 'startNodeId'.");
+              if (!data.nodes || typeof data.nodes !== "object" || Array.isArray(data.nodes)) {
+                throw new Error("Invalid operational nodes block design format provided.");
+              }
+
+              setTreeId(data.id);
+              setStartNodeId(data.startNodeId);
+
+              // 1. Gather any explicitly declared global flags
+              const extractedFlags = new Set();
+              if (data.worldState && Array.isArray(data.worldState.flags)) {
+                data.worldState.flags.forEach(f => extractedFlags.add(f));
+              }
+
+              // 2. Deep-scan all nodes to harvest any implicitly used flags so nothing is left out
+              Object.values(data.nodes).forEach(node => {
+                if (node.setsFlag) extractedFlags.add(node.setsFlag);
+
+                if (node.conditions) {
+                  node.conditions.forEach(c => {
+                    if (c.requiresFlag) extractedFlags.add(c.requiresFlag);
+                  });
+                }
+
+                if (node.choices) {
+                  node.choices.forEach(c => {
+                    if (c.requiresFlag) extractedFlags.add(c.requiresFlag);
+                    if (c.setsFlag) extractedFlags.add(c.setsFlag);
+                  });
+                }
+              });
+
+              // 3. Commit the unique collection back to our reactive environment state
+              setFlags(Array.from(extractedFlags));
+
+              const rehydratedNodes = {};
+              let indexCount = 0;
+              Object.entries(data.nodes).forEach(([key, value]) => {
+                // Look for positioning data inside the metadata block, fall back to historical layout properties or auto-grid mapping
+                const metadataX = value.editorMetadata?.x ?? value.x;
+                const metadataY = value.editorMetadata?.y ?? value.y;
+
+                rehydratedNodes[key] = {
+                  ...value,
+                  x: metadataX ?? 80 + (indexCount % 3) * 360,
+                  y: metadataY ?? 80 + Math.floor(indexCount / 3) * 260,
+                };
+                indexCount++;
+              });
+
+              setNodes(rehydratedNodes);
+              const firstKey = Object.keys(rehydratedNodes)[0];
+              setSelectedNodeId(rehydratedNodes[data.startNodeId] ? data.startNodeId : firstKey);
+              setErrorMessage("");
+              alert("Dialogue graph system dataset state rehydrated successfully!");
+            } catch (err) {
+              setErrorMessage(`Import Error: ${err.message}`);
+            }
+          };
+          fileReader.readAsText(e.target.files[0]);
+        };
+
+        // Playtest Evaluation Pipeline Engine
+        const normalizeFlags = value => {
+          if (Array.isArray(value)) return value;
+          if (typeof value === "string" && value.trim()) return [value.trim()];
+          return [];
+        };
+
+        const startPlaytest = (initialFlags = flags) => {
+          const seededFlags = normalizeFlags(initialFlags);
+          setPlaytestActiveFlags(seededFlags);
+          // Check if conditional routing triggers right away on start node
+          evaluateAndGo(startNodeId, seededFlags);
+        };
+
+        const togglePlaytestFlag = flag => {
+          setPlaytestActiveFlags(prev => {
+            const currentFlags = normalizeFlags(prev);
+            return currentFlags.includes(flag) ? currentFlags.filter(f => f !== flag) : [...currentFlags, flag];
+          });
+        };
+
+        const clearPlaytestFlags = () => {
+          setPlaytestActiveFlags([]);
+        };
+
+        const restorePlaytestFlags = () => {
+          setPlaytestActiveFlags(normalizeFlags(flags));
+        };
+
+        const evaluateAndGo = (targetId, currentFlags) => {
+          if (!targetId || !nodes[targetId]) {
+            setPlaytestNodeId(targetId); // Marks end or broken path
+            return;
+          }
+
+          const nodeData = nodes[targetId];
+          let nextTarget = targetId;
+          let traversed = true;
+          let activeFlags = [...currentFlags];
+
+          // Check self triggering node structural flag hooks
+          if (nodeData.setsFlag && !activeFlags.includes(nodeData.setsFlag)) {
+            activeFlags.push(nodeData.setsFlag);
+          }
+
+          // First checking matching sequence conditions
+          if (nodeData.conditions && nodeData.conditions.length > 0) {
+            for (let cond of nodeData.conditions) {
+              if (activeFlags.includes(cond.requiresFlag)) {
+                nextTarget = cond.nextNodeId;
+                traversed = false;
+                break;
+              }
+            }
+          }
+
+          setPlaytestActiveFlags(activeFlags);
+          if (!traversed) {
+            evaluateAndGo(nextTarget, activeFlags);
+          } else {
+            setPlaytestNodeId(targetId);
+          }
+        };
+
+        const handlePlaytestChoice = choice => {
+          let currentFlags = [...playtestActiveFlags];
+          if (choice.setsFlag && !currentFlags.includes(choice.setsFlag)) {
+            currentFlags.push(choice.setsFlag);
+          }
+          setPlaytestActiveFlags(currentFlags);
+          evaluateAndGo(choice.nextNodeId, currentFlags);
+        };
+
+        // Utility connections line calculations rendering calculations paths
+        const getConnectorPath = (fromId, toId) => {
+          const source = nodes[fromId];
+          const target = nodes[toId];
+          if (!source || !target) return "";
+
+          const startX = source.x + nodeWidth;
+          const startY = source.y + nodeHeight / 2;
+          const endX = target.x;
+          const endY = target.y + nodeHeight / 2;
+
+          const controlX1 = startX + 80;
+          const controlY1 = startY;
+          const controlX2 = endX - 80;
+          const controlY2 = endY;
+
+          return `M ${startX} ${startY} C ${controlX1} ${controlY1}, ${controlX2} ${controlY2}, ${endX} ${endY}`;
+        };
+
+        const activeNodeData = nodes[selectedNodeId] || null;
+
+        return (
+          <div className="flex flex-col h-screen select-none bg-slate-950 font-sans">
+            {/* Top Control Header Bar Area */}
+            <header className="flex items-center justify-between px-6 py-3 bg-slate-900 border-b border-slate-800 shrink-0 shadow-md z-10">
+              <div className="flex items-center gap-3">
+                <i className="fa-solid fa-square-share-nodes text-indigo-400 text-2xl"></i>
+                <div>
+                  <h1 className="text-sm font-bold tracking-wider text-slate-200 uppercase">Skyrelda Core</h1>
+                  <input
+                    type="text"
+                    value={treeId}
+                    onChange={e => setTreeId(e.target.value.trim().toLowerCase())}
+                    className="bg-transparent border-b border-slate-700 text-indigo-300 font-mono font-medium focus:outline-none focus:border-indigo-400 text-xs py-0.5"
+                    placeholder="conversation-id"
+                  />
+                </div>
+              </div>
+
+              {/* Search Bar Integration */}
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 w-64">
+                <i className="fa-solid fa-magnifying-glass text-slate-500 text-xs mr-2"></i>
+                <input
+                  type="text"
+                  placeholder="Search dialogue nodes text..."
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  className="bg-transparent text-xs text-slate-300 focus:outline-none w-full"
+                />
+              </div>
+
+              {/* Top Control Button Cluster Grid Layout */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={addNode}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded transition"
+                >
+                  <i className="fa-solid fa-plus"></i> Node
+                </button>
+
+                <button
+                  onClick={startPlaytest}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded transition"
+                >
+                  <i className="fa-solid fa-gamepad"></i> Run Test
+                </button>
+                <label className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition cursor-pointer">
+                  <i className="fa-solid fa-file-import"></i> Import
+                  <input type="file" accept=".json" onChange={importJSON} className="hidden" />
+                </label>
+                <button
+                  onClick={copyJSON}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded transition"
+                >
+                  <i className="fa-solid fa-copy"></i> Copy JSON
+                </button>
+                <button
+                  onClick={exportJSON}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-indigo-500 hover:bg-indigo-400 text-white rounded transition"
+                >
+                  <i className="fa-solid fa-file-export"></i> Export JSON
+                </button>
+              </div>
+            </header>
+
+            {/* Notification System Indicator Row banner */}
+            {errorMessage && (
+              <div className="bg-rose-950 border-b border-rose-800 px-6 py-2 flex items-center justify-between text-xs text-rose-300 animate-pulse">
+                <span className="flex items-center gap-2">
+                  <i className="fa-solid fa-triangle-exclamation"></i> {errorMessage}
+                </span>
+                <button onClick={() => setErrorMessage("")} className="text-rose-400 hover:text-rose-200">
+                  <i className="fa-solid fa-xmark"></i>
+                </button>
+              </div>
+            )}
+
+            {/* Layout Framework Core View Workspace Container Body split panels */}
+            <div className="flex flex-1 overflow-hidden relative">
+              {/* LEFT SECTION PANELS FRAMEWORK COMPONENT LAYOUT WORKSPACE */}
+              <div className="flex-1 relative overflow-hidden h-full">
+                {/* Canvas control layer scale interfaces overlay */}
+                <div className="absolute bottom-4 left-4 bg-slate-900/90 border border-slate-800 rounded-lg p-1.5 flex gap-1 z-10 shadow-xl backdrop-blur-sm">
+                  <button
+                    onClick={zoomOut}
+                    className="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xs text-slate-300 transition"
+                  >
+                    <i className="fa-solid fa-minus"></i>
+                  </button>
+                  <span className="px-2 flex items-center justify-center font-mono text-xs text-slate-400 min-w-14">
+                    {Math.round(zoom * 100)}%
+                  </span>
+                  <button
+                    onClick={zoomIn}
+                    className="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xs text-slate-300 transition"
+                  >
+                    <i className="fa-solid fa-plus"></i>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setZoom(1);
+                      setPan({ x: 0, y: 0 });
+                    }}
+                    className="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xs text-slate-300 transition"
+                    title="Recenter Workspace View"
+                  >
+                    <i className="fa-solid fa-arrow-rotate-left"></i>
+                  </button>
+                </div>
+
+                {/* Canvas workspace block */}
+                <div
+                  ref={canvasRef}
+                  onMouseDown={handleCanvasMouseDown}
+                  onMouseMove={handleCanvasMouseMove}
+                  onMouseUp={handleCanvasMouseUp}
+                  onMouseLeave={handleCanvasMouseUp}
+                  onWheel={handleCanvasWheel}
+                  className="w-full h-full cursor-grab active:cursor-grabbing relative overflow-hidden graph-bg bg-slate-950"
+                >
+                  <div
+                    className="absolute origin-top-left pointer-events-none"
+                    style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+                  >
+                    {/* SVG dynamic line connection framework tracks element */}
+                    <svg className="absolute overflow-visible top-0 left-0 w-1 h-1 pointer-events-none">
+                      <defs>
+                        <marker
+                          id="arrow"
+                          viewBox="0 0 10 10"
+                          refX="6"
+                          refY="5"
+                          markerWidth="6"
+                          markerHeight="6"
+                          orient="auto-start-reverse"
+                        >
+                          <path d="M 0 1 L 10 5 L 0 9 z" fill="#6366f1" />
+                        </marker>
+                        <marker
+                          id="arrow-broken"
+                          viewBox="0 0 10 10"
+                          refX="6"
+                          refY="5"
+                          markerWidth="6"
+                          markerHeight="6"
+                          orient="auto-start-reverse"
+                        >
+                          <path d="M 0 1 L 10 5 L 0 9 z" fill="#f43f5e" />
+                        </marker>
+                      </defs>
+
+                      {Object.entries(nodes).map(([id, node]) => {
+                        const links = [];
+
+                        if (node.autoNextNodeId) {
+                          links.push({ target: node.autoNextNodeId, type: "auto" });
+                        }
+                        if (node.conditions) {
+                          node.conditions.forEach(c => {
+                            if (c.nextNodeId) links.push({ target: c.nextNodeId, type: "cond" });
+                          });
+                        }
+                        if (node.choices) {
+                          node.choices.forEach(c => {
+                            if (c.nextNodeId) links.push({ target: c.nextNodeId, type: "choice" });
+                          });
+                        }
+
+                        return links.map((link, idx) => {
+                          const isBroken = !nodes[link.target];
+                          if (isBroken) return null; // Broken links handled in node visualization warnings
+
+                          return (
+                            <path
+                              key={`${id}-link-${idx}`}
+                              d={getConnectorPath(id, link.target)}
+                              fill="none"
+                              stroke={link.type === "cond" ? "#a855f7" : link.type === "auto" ? "#10b981" : "#6366f1"}
+                              strokeWidth="2.5"
+                              strokeDasharray={link.type === "cond" ? "4 4" : "0"}
+                              markerEnd="url(#arrow)"
+                              className="opacity-70"
+                            />
+                          );
+                        });
+                      })}
+                    </svg>
+
+                    {/* Map dynamic absolute positioning nodes rendering grids block elements loop */}
+                    {Object.entries(nodes).map(([id, node]) => {
+                      const isSelected = selectedNodeId === id;
+                      const isStart = startNodeId === id;
+                      const isUnreachable = unreachableNodes.includes(id);
+                      const hasBrokenLink = brokenLinks.some(b => b.from === id);
+
+                      // Filter lookup matching parameter evaluation arrays text bounds strings definitions
+                      if (
+                        searchQuery &&
+                        !node.text.toLowerCase().includes(searchQuery.toLowerCase()) &&
+                        !node.speaker.toLowerCase().includes(searchQuery.toLowerCase()) &&
+                        !id.toLowerCase().includes(searchQuery.toLowerCase())
+                      ) {
+                        return null;
+                      }
+
+                      return (
+                        <div
+                          key={id}
+                          onMouseDown={e => handleNodeDragStart(e, id)}
+                          className={`node-card absolute pointer-events-auto rounded-xl p-4 flex flex-col justify-between select-none shadow-2xl transition-all duration-150 border-2 ${
+                            isSelected
+                              ? "bg-slate-900 border-indigo-500 shadow-indigo-500/20 ring-4 ring-indigo-500/10"
+                              : "bg-slate-900/95 border-slate-800"
+                          } ${isUnreachable ? "opacity-60 ring-2 ring-amber-500/40" : ""} ${hasBrokenLink ? "border-rose-500/80 shadow-rose-500/10" : ""}`}
+                          style={{
+                            left: node.x,
+                            top: node.y,
+                            width: nodeWidth,
+                            height: nodeHeight,
+                            cursor: draggedNodeId === id ? "grabbing" : "grab",
+                          }}
+                        >
+                          {/* Top Bar: IDs and Actions */}
+                          <div className="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-2 gap-1.5 shrink-0">
+                            <div className="flex items-center gap-1.5 truncate max-w-[70%]">
+                              {isStart && (
+                                <span className="bg-emerald-500/20 text-emerald-400 font-extrabold text-[9px] px-1.5 py-0.5 rounded tracking-wide uppercase border border-emerald-500/30">
+                                  Start
+                                </span>
+                              )}
+                              <span className="font-mono text-[10px] text-slate-400 truncate" title={id}>
+                                {id}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {hasBrokenLink && (
+                                <i
+                                  className="fa-solid fa-circle-exclamation text-rose-400 text-xs animate-bounce"
+                                  title="Contains unresolved structural target broken endpoints links!"
+                                ></i>
+                              )}
+                              {isUnreachable && (
+                                <i
+                                  className="fa-solid fa-arrow-turn-down text-amber-400 text-xs"
+                                  title="Warning: This dialogue segment block index point is visually isolated/unreachable."
+                                ></i>
+                              )}
+                              <button
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  deleteNode(id);
+                                }}
+                                className="text-slate-500 hover:text-rose-400 p-0.5 transition"
+                              >
+                                <i className="fa-solid fa-trash-can text-xs"></i>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Scrollable/Clamped Content Area */}
+                          <div className="flex-1 min-h-0 overflow-hidden flex flex-col justify-start">
+                            <div
+                              className="flex items-center gap-1 text-[10px] text-indigo-300 font-semibold uppercase tracking-wider mb-1 truncate"
+                              title={node.speaker}
+                            >
+                              <i className="fa-solid fa-user-tag text-[9px] text-slate-500"></i>
+                              {node.speaker || "No Speaker Specified"}
+                            </div>
+
+                            {/* Dialogue Text: Fixed 3-line limit with HTML hover tooltip */}
+                            <p
+                              className="text-slate-300 text-xs line-clamp-3 leading-relaxed font-normal break-words"
+                              title={node.text}
+                            >
+                              {node.text || <span className="text-slate-600 italic">No dialogue line recorded...</span>}
+                            </p>
+                          </div>
+
+                          {/* Bottom Status Row */}
+                          <div className="flex items-center justify-between text-[9px] text-slate-500 pt-2 border-t border-slate-800/50 mt-1 font-mono shrink-0">
+                            <span className="truncate mr-2">{node.choices ? `${node.choices.length} choice(s)` : "Auto-advance"}</span>
+                            {node.setsFlag && (
+                              <span className="text-purple-400 truncate max-w-[50%]" title={node.setsFlag}>
+                                <i className="fa-solid fa-flag text-[8px]"></i> +{node.setsFlag}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* RIGHT SECTION CONTROL INSPECTOR PANELS INTERFACES CONTAINER FRAMEWORK */}
+              <aside className="w-96 bg-slate-900 border-l border-slate-800 flex flex-col h-full shrink-0 shadow-2xl z-10">
+                {/* Panel Tab Option Selector Navigation bar labels header controls */}
+                <div className="border-b border-slate-800 bg-slate-950/60 p-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <i className="fa-solid fa-sliders text-indigo-400"></i>
+                    <h2 className="text-xs font-bold tracking-wider uppercase text-slate-300">Inspector Properties Node</h2>
+                  </div>
+                  {activeNodeData && (
+                    <button
+                      onClick={() => setStartNodeId(selectedNodeId)}
+                      disabled={startNodeId === selectedNodeId}
+                      className={`px-2 py-1 rounded text-[10px] font-bold tracking-wide transition border uppercase ${
+                        startNodeId === selectedNodeId
+                          ? "bg-emerald-950/30 border-emerald-800/40 text-emerald-400"
+                          : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
+                      }`}
+                    >
+                      {startNodeId === selectedNodeId ? "Primary Entry Set" : "Set as Entry Point"}
+                    </button>
+                  )}
+                </div>
+
+                {/* Property Edit Canvas Forms body dynamic layout render blocks wrapper context handles */}
+                <div className="flex-1 overflow-y-auto p-4 space-y-5 no-scrollbar">
+                  {activeNodeData ? (
+                    <>
+                      {/* Meta configurations IDs tracking segments fields inputs info groups boxes updates */}
+                      <div className="grid grid-cols-2 gap-3 bg-slate-950/40 p-3 rounded-lg border border-slate-800/60">
+                        {/* Right Panel: Node Unique ID Input Field Block */}
+                        <div>
+                          <label className="block text-[10px] font-bold tracking-wide text-slate-400 uppercase mb-1">
+                            Node Unique ID
+                          </label>
+                          <input
+                            type="text"
+                            // Use key to force input rehydration when the active selected node switches
+                            key={selectedNodeId}
+                            defaultValue={selectedNodeId}
+                            onBlur={e => {
+                              const newId = e.target.value.trim().toLowerCase();
+                              if (newId && newId !== selectedNodeId) {
+                                changeNodeId(selectedNodeId, newId);
+                              }
+                            }}
+                            onKeyDown={e => {
+                              if (e.key === "Enter") {
+                                const newId = e.currentTarget.value.trim().toLowerCase();
+                                if (newId && newId !== selectedNodeId) {
+                                  changeNodeId(selectedNodeId, newId);
+                                  e.currentTarget.blur(); // Fire onBlur execution cycle
+                                }
+                              }
+                            }}
+                            className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs font-mono text-indigo-300 focus:outline-none focus:border-indigo-500"
+                            placeholder="e.g., greet-npc"
+                          />
+                          <p className="text-[9px] text-slate-500 font-mono mt-1">
+                            Must be unique kebab-case. Renaming safely updates all child branches[cite: 1].
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold tracking-wide text-slate-400 uppercase mb-1">
+                            Speaker Tag
+                          </label>
+                          <input
+                            type="text"
+                            value={activeNodeData.speaker || ""}
+                            onChange={e => updateNodeProperty(selectedNodeId, "speaker", e.target.value)}
+                            className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                            placeholder="Speaker Name"
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="block text-[10px] font-bold tracking-wide text-slate-400 uppercase mb-1">
+                            Portrait Key
+                          </label>
+                          <input
+                            type="text"
+                            value={activeNodeData.portrait || "none"}
+                            onChange={e => updateNodeProperty(selectedNodeId, "portrait", e.target.value.trim().toLowerCase())}
+                            className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-indigo-500"
+                            placeholder="portrait-id-kebab"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Core Textbox parameters components text data inputs parameters configurations blocks */}
+                      <div>
+                        <div className="flex justify-between items-center mb-1">
+                          <label className="block text-[10px] font-bold tracking-wide text-slate-400 uppercase">
+                            Dialogue Script Content Text Line
+                          </label>
+                          <span
+                            className={`text-[10px] font-mono ${(activeNodeData.text || "").length > 200 ? "text-amber-400" : "text-slate-500"}`}
+                          >
+                            {(activeNodeData.text || "").length}/200 chars
+                          </span>
+                        </div>
+                        <textarea
+                          value={activeNodeData.text || ""}
+                          onChange={e => updateNodeProperty(selectedNodeId, "text", e.target.value)}
+                          rows="3"
+                          className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 resize-none leading-relaxed"
+                          placeholder="Write dialogue content line strings here..."
+                        />
+                      </div>
+
+                      {/* Immediate entry Node Flags trigger mutations triggers sets field block configurations container updates */}
+                      <div className="bg-slate-950/30 p-3 rounded-lg border border-slate-800">
+                        <label className="block text-[10px] font-bold tracking-wide text-purple-400 uppercase mb-1">
+                          On-Entry Node Trigger Action: Sets World Flag
+                        </label>
+                        <select
+                          value={activeNodeData.setsFlag || ""}
+                          onChange={e => updateNodeProperty(selectedNodeId, "setsFlag", e.target.value || undefined)}
+                          className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 font-mono"
+                        >
+                          <option value="">-- No Flag Action Trigger Set --</option>
+                          {flags.map(f => (
+                            <option key={f} value={f}>
+                              {f}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <hr className="border-slate-800" />
+
+                      {/* Structural Redirects Condition System Lists blocks logic configuration panel segment UI container layout setup */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-[10px] font-bold tracking-wide text-purple-400 uppercase">
+                            Conditional Intercept Redirects Bypass Rules
+                          </label>
+                          <button
+                            onClick={() => {
+                              const currentConds = activeNodeData.conditions || [];
+                              updateNodeProperty(selectedNodeId, "conditions", [
+                                ...currentConds,
+                                { requiresFlag: flags[0] || "flag", nextNodeId: "" },
+                              ]);
+                            }}
+                            className="text-purple-400 hover:text-purple-300 text-[10px] font-bold flex items-center gap-1"
+                          >
+                            <i className="fa-solid fa-plus-circle"></i> Add Condition Rule
+                          </button>
+                        </div>
+                        <div className="space-y-2">
+                          {activeNodeData.conditions &&
+                            activeNodeData.conditions.map((cond, idx) => (
+                              <div key={idx} className="bg-slate-950/60 border border-purple-900/50 rounded p-2.5 space-y-2 relative">
+                                <button
+                                  onClick={() => {
+                                    const filtered = activeNodeData.conditions.filter((_, i) => i !== idx);
+                                    updateNodeProperty(selectedNodeId, "conditions", filtered.length > 0 ? filtered : undefined);
+                                  }}
+                                  className="absolute top-2 right-2 text-slate-500 hover:text-rose-400"
+                                >
+                                  <i className="fa-solid fa-xmark text-xs"></i>
+                                </button>
+                                <div>
+                                  <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                                    Requires Active Flag Config
+                                  </label>
+                                  <select
+                                    value={cond.requiresFlag}
+                                    onChange={e => {
+                                      const updated = [...activeNodeData.conditions];
+                                      updated[idx].requiresFlag = e.target.value;
+                                      updateNodeProperty(selectedNodeId, "conditions", updated);
+                                    }}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-xs text-slate-300 font-mono focus:outline-none"
+                                  >
+                                    {flags.map(f => (
+                                      <option key={f} value={f}>
+                                        {f}
+                                      </option>
+                                    ))}
+                                    {!flags.includes(cond.requiresFlag) && (
+                                      <option value={cond.requiresFlag}>{cond.requiresFlag} (Missing/Undefined)</option>
+                                    )}
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                                    Redirect Target Destination Node
+                                  </label>
+                                  <select
+                                    value={cond.nextNodeId}
+                                    onChange={e => {
+                                      const updated = [...activeNodeData.conditions];
+                                      updated[idx].nextNodeId = e.target.value;
+                                      updateNodeProperty(selectedNodeId, "conditions", updated);
+                                    }}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-xs text-indigo-300 font-mono focus:outline-none"
+                                  >
+                                    <option value="">-- Choose target destination --</option>
+                                    {Object.keys(nodes).map(nid => (
+                                      <option key={nid} value={nid}>
+                                        {nid}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  {cond.nextNodeId && !nodes[cond.nextNodeId] && (
+                                    <p className="text-[10px] text-rose-400 mt-0.5">
+                                      <i className="fa-solid fa-triangle-exclamation"></i> Broken path target links reference error!
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          {(!activeNodeData.conditions || activeNodeData.conditions.length === 0) && (
+                            <p className="text-slate-600 text-xs italic text-center py-2 border border-dashed border-slate-800 rounded">
+                              No automated redirect criteria established on this node segment block point.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <hr className="border-slate-800" />
+
+                      {/* Dynamic Response Choice Arrays or AutoNext configuration settings setup panel components segments section */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-[10px] font-bold tracking-wide text-indigo-400 uppercase">
+                            Interactive Branch Choice Options Systems
+                          </label>
+                          {!activeNodeData.hasOwnProperty("autoNextNodeId") && (
+                            <button
+                              onClick={() => {
+                                const currentChoices = activeNodeData.choices || [];
+                                if (currentChoices.length >= 4) {
+                                  alert(
+                                    "Maximum output array branch limits configured to top boundary limits allowance schema configuration properties rules.",
+                                  );
+                                  return;
+                                }
+                                updateNodeProperty(selectedNodeId, "choices", [
+                                  ...currentChoices,
+                                  { label: "New Choice Line Option Text", nextNodeId: null },
+                                ]);
+                              }}
+                              className="text-indigo-400 hover:text-indigo-300 text-[10px] font-bold flex items-center gap-1"
+                            >
+                              <i className="fa-solid fa-plus-circle"></i> Add Choice Track
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Choice Mode Layout Selection Switcher Logic Configuration */}
+                        <div className="flex rounded-md bg-slate-950 p-0.5 mb-3 border border-slate-800">
+                          <button
+                            className={`flex-1 text-center py-1 text-[10px] font-bold rounded uppercase tracking-wider transition ${activeNodeData.choices ? "bg-indigo-600 text-white shadow" : "text-slate-400 hover:text-slate-200"}`}
+                            onClick={() => {
+                              const updatedNode = { ...activeNodeData };
+                              delete updatedNode.autoNextNodeId;
+                              updatedNode.choices = [{ label: "Continue Response Input Option", nextNodeId: null }];
+                              setNodes(prev => ({ ...prev, [selectedNodeId]: updatedNode }));
+                            }}
+                          >
+                            Player Choice Block
+                          </button>
+                          <button
+                            className={`flex-1 text-center py-1 text-[10px] font-bold rounded uppercase tracking-wider transition ${activeNodeData.hasOwnProperty("autoNextNodeId") ? "bg-emerald-600 text-white shadow" : "text-slate-400 hover:text-slate-200"}`}
+                            onClick={() => {
+                              const updatedNode = { ...activeNodeData };
+                              delete updatedNode.choices;
+                              updatedNode.autoNextNodeId = null;
+                              setNodes(prev => ({ ...prev, [selectedNodeId]: updatedNode }));
+                            }}
+                          >
+                            Auto-Advance Node
+                          </button>
+                        </div>
+
+                        {/* Render Layout matching active flow configuration setup path */}
+                        {activeNodeData.choices ? (
+                          <div className="space-y-3">
+                            {activeNodeData.choices.map((choice, idx) => (
+                              <div key={idx} className="bg-slate-950/50 border border-slate-800 rounded-lg p-3 space-y-2 relative">
+                                <button
+                                  onClick={() => {
+                                    const filteredChoices = activeNodeData.choices.filter((_, i) => i !== idx);
+                                    updateNodeProperty(selectedNodeId, "choices", filteredChoices.length > 0 ? filteredChoices : []);
+                                  }}
+                                  className="absolute top-2 right-2 text-slate-500 hover:text-rose-400 transition"
+                                >
+                                  <i className="fa-solid fa-trash-can text-xs"></i>
+                                </button>
+
+                                <div>
+                                  <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                                    Choice UI Display Label Text
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={choice.label}
+                                    onChange={e => {
+                                      const updated = [...activeNodeData.choices];
+                                      updated[idx].label = e.target.value;
+                                      updateNodeProperty(selectedNodeId, "choices", updated);
+                                    }}
+                                    maxLength="60"
+                                    className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                                    placeholder="Label shown to player..."
+                                  />
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-2 pt-1">
+                                  <div>
+                                    <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">Target Link</label>
+                                    <select
+                                      value={choice.nextNodeId || ""}
+                                      onChange={e => {
+                                        const updated = [...activeNodeData.choices];
+                                        updated[idx].nextNodeId = e.target.value || null;
+                                        updateNodeProperty(selectedNodeId, "choices", updated);
+                                      }}
+                                      className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-[11px] text-indigo-300 font-mono focus:outline-none"
+                                    >
+                                      <option value="">Conversation End (null)</option>
+                                      {Object.keys(nodes).map(nid => (
+                                        <option key={nid} value={nid}>
+                                          {nid}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                  <div className="pt-2">
+                                    <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                                      Visibility Prerequisite (requiresFlag)
+                                    </label>
+                                    <select
+                                      value={choice.requiresFlag || ""}
+                                      onChange={e => {
+                                        const updated = [...activeNodeData.choices];
+                                        if (e.target.value) {
+                                          updated[idx].requiresFlag = e.target.value;
+                                        } else {
+                                          delete updated[idx].requiresFlag;
+                                        }
+                                        updateNodeProperty(selectedNodeId, "choices", updated);
+                                      }}
+                                      className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-[11px] text-amber-400 font-mono focus:outline-none"
+                                    >
+                                      <option value="">Always Visible (No Flag Required)</option>
+                                      {flags.map(f => (
+                                        <option key={f} value={f}>
+                                          {f}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                                      Sets Flag Modifier
+                                    </label>
+                                    <select
+                                      value={choice.setsFlag || ""}
+                                      onChange={e => {
+                                        const updated = [...activeNodeData.choices];
+                                        if (e.target.value) updated[idx].setsFlag = e.target.value;
+                                        else delete updated[idx].setsFlag;
+                                        updateNodeProperty(selectedNodeId, "choices", updated);
+                                      }}
+                                      className="w-full bg-slate-900 border border-slate-700 rounded p-1 text-[11px] text-purple-400 font-mono focus:outline-none"
+                                    >
+                                      <option value="">None</option>
+                                      {flags.map(f => (
+                                        <option key={f} value={f}>
+                                          {f}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                </div>
+
+                                {/* Additional Advanced Game Logic Quest system triggers settings panel setup block tracking configuration parameters */}
+                                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-900 mt-2">
+                                  <div>
+                                    <label className="block text-[9px] font-mono text-slate-600 uppercase mb-0.5">
+                                      Starts Quest ID
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={choice.startsQuest || ""}
+                                      onChange={e => {
+                                        const updated = [...activeNodeData.choices];
+                                        if (e.target.value.trim()) updated[idx].startsQuest = e.target.value.trim().toLowerCase();
+                                        else delete updated[idx].startsQuest;
+                                        updateNodeProperty(selectedNodeId, "choices", updated);
+                                      }}
+                                      placeholder="quest-id-kebab"
+                                      className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[10px] text-slate-400 font-mono focus:outline-none"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="block text-[9px] font-mono text-slate-600 uppercase mb-0.5">
+                                      Completes Quest ID
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={choice.completesQuest || ""}
+                                      onChange={e => {
+                                        const updated = [...activeNodeData.choices];
+                                        if (e.target.value.trim()) updated[idx].completesQuest = e.target.value.trim().toLowerCase();
+                                        else delete updated[idx].completesQuest;
+                                        updateNodeProperty(selectedNodeId, "choices", updated);
+                                      }}
+                                      placeholder="quest-id-kebab"
+                                      className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[10px] text-slate-400 font-mono focus:outline-none"
+                                    />
+                                  </div>
+                                </div>
+
+                                {choice.nextNodeId && !nodes[choice.nextNodeId] && (
+                                  <p className="text-[10px] text-rose-400 mt-1">
+                                    <i className="fa-solid fa-triangle-exclamation"></i> Choice target configuration link reference
+                                    error map validation fails broken path!
+                                  </p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-3 space-y-2">
+                            <label className="block text-[9px] font-mono text-slate-500 uppercase mb-0.5">
+                              Automated AutoAdvance Target Redirect Node
+                            </label>
+                            <select
+                              value={activeNodeData.autoNextNodeId || ""}
+                              onChange={e => updateNodeProperty(selectedNodeId, "autoNextNodeId", e.target.value || null)}
+                              className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-emerald-400 font-mono focus:outline-none focus:border-indigo-500"
+                            >
+                              <option value="">Conversation Terminate End Point Track Block (null)</option>
+                              {Object.keys(nodes).map(nid => (
+                                <option key={nid} value={nid}>
+                                  {nid}
+                                </option>
+                              ))}
+                            </select>
+                            {activeNodeData.autoNextNodeId && !nodes[activeNodeData.autoNextNodeId] && (
+                              <p className="text-[10px] text-rose-400 mt-1">
+                                <i className="fa-solid fa-triangle-exclamation"></i> Auto-advance broken endpoint destination
+                                configuration links error reference mismatch found!
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-600 text-center p-6 italic">
+                      <i className="fa-solid fa-bezier-curve text-3xl mb-2 text-slate-700"></i>
+                      Select a dialogue tree network diagram node point box asset component framework to begin editing operations
+                      configuration profiles.
+                    </div>
+                  )}
+                </div>
+
+                {/* BOTTOM REGION SUBPANEL INTERFACE STORES FLAG WORLD MANAGER BLOCKS VIEW OVERLAY */}
+                <div className="border-t border-slate-800 bg-slate-950 p-4 space-y-3 shrink-0 max-h-56 overflow-y-auto no-scrollbar">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5">
+                      <i className="fa-solid fa-flag text-purple-400 text-xs"></i>
+                      <h3 className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">Registered World State Flags</h3>
+                    </div>
+                    <button
+                      onClick={addFlag}
+                      className="text-purple-400 hover:text-purple-300 text-[10px] font-bold flex items-center gap-1"
+                    >
+                      <i className="fa-solid fa-plus-circle"></i> Add Flag
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {flags.map(flag => (
+                      <span
+                        key={flag}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900 border border-slate-800 font-mono text-[10px] text-purple-300 shadow-sm"
+                      >
+                        {flag}
+                        <button onClick={() => removeFlag(flag)} className="text-slate-600 hover:text-rose-400 font-bold ml-0.5">
+                          <i className="fa-solid fa-xmark text-[9px]"></i>
+                        </button>
+                      </span>
+                    ))}
+                    {flags.length === 0 && (
+                      <p className="text-[11px] text-slate-600 italic py-1">
+                        No state variables registered in scope environment profile definitions.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </aside>
+            </div>
+
+            {/* INTERACTIVE PLAYTEST PLAY SIMULATOR MODAL PANEL OVERLAY WINDOW */}
+            {playtestNodeId !== null && (
+              <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                <div className="w-full max-w-xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden max-h-[85vh]">
+                  {/* Simulator header options banner bar definitions */}
+                  <div className="px-5 py-3 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
+                    <div className="flex items-center gap-2">
+                      <i className="fa-solid fa-circle-play text-emerald-400 animate-pulse"></i>
+                      <span className="text-xs font-bold tracking-wider uppercase text-slate-300 font-mono">
+                        Live Narrative Engine Playtest Environment Simulator View
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => setPlaytestNodeId(null)}
+                      className="text-slate-400 hover:text-slate-200 p-1 rounded-lg hover:bg-slate-800 transition"
+                    >
+                      <i className="fa-solid fa-xmark"></i>
+                    </button>
+                  </div>
+
+                  {/* Active runtime simulation engine panel framework content logs rendering display segments wrapper container */}
+                  <div className="flex-1 overflow-y-auto p-6 space-y-6 no-scrollbar">
+                    {nodes[playtestNodeId] ? (
+                      (() => {
+                        const node = nodes[playtestNodeId];
+                        return (
+                          <div className="space-y-6">
+                            {/* Game Dialogue Box Mock UI Design View Canvas representation */}
+                            <div className="bg-slate-950 rounded-xl p-5 border border-slate-800 relative shadow-inner">
+                              {/* Nameplate tag overlay layout banner */}
+                              <div className="absolute -top-3 left-4 bg-indigo-600 px-3 py-0.5 rounded text-[10px] font-bold tracking-wider text-white uppercase shadow-md">
+                                {node.speaker || "Narrator"}
+                              </div>
+                              <div className="pt-2 text-slate-200 text-sm leading-relaxed font-serif whitespace-pre-line">
+                                {node.text}
+                              </div>
+                              <div className="mt-3 flex justify-end text-[10px] font-mono text-slate-600">
+                                Portrait Sprite Anchor: {node.portrait || "none"}
+                              </div>
+                            </div>
+
+                            <div className="bg-slate-950 rounded-xl p-4 border border-slate-800 space-y-3">
+                              <div className="flex items-center justify-between">
+                                <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                  Session Flag Controls
+                                </div>
+                                <div className="flex gap-2">
+                                  <button onClick={restorePlaytestFlags} className="text-[10px] text-slate-400 hover:text-slate-200">
+                                    Use World Flags
+                                  </button>
+                                  <button onClick={clearPlaytestFlags} className="text-[10px] text-slate-400 hover:text-slate-200">
+                                    Clear All
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {flags.map(flag => {
+                                  const isActive = playtestActiveFlags.includes(flag);
+                                  return (
+                                    <button
+                                      key={flag}
+                                      onClick={() => togglePlaytestFlag(flag)}
+                                      className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border text-[10px] font-mono transition ${
+                                        isActive
+                                          ? "bg-emerald-950/70 border-emerald-700 text-emerald-300"
+                                          : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200"
+                                      }`}
+                                    >
+                                      <i className={`fa-solid ${isActive ? "fa-toggle-on" : "fa-toggle-off"}`}></i>
+                                      {flag}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+
+                            {/* Decisions Choice Branch Lists Selection Grid elements interaction wrappers loops handles */}
+                            <div className="space-y-2">
+                              <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">
+                                Available Response Pathways:
+                              </div>
+
+                              {node.choices && node.choices.length > 0 ? (
+                                node.choices.map((choice, i) => {
+                                  // Schema specifies handling hidden/restricted entries conditional requirements parameters checks filters
+                                  const isHidden = choice.requiresFlag && !playtestActiveFlags.includes(choice.requiresFlag);
+                                  if (isHidden) return null;
+
+                                  return (
+                                    <button
+                                      key={i}
+                                      onClick={() => handlePlaytestChoice(choice)}
+                                      className="w-full text-left bg-slate-800 hover:bg-indigo-950/40 border border-slate-700 hover:border-indigo-500/50 rounded-xl p-3 text-xs text-slate-300 hover:text-indigo-200 transition group flex items-center justify-between"
+                                    >
+                                      <span className="flex items-center gap-2">
+                                        <span className="w-5 h-5 rounded-md bg-slate-950 flex items-center justify-center font-mono text-[10px] text-indigo-400 group-hover:bg-indigo-600 group-hover:text-white transition">
+                                          {i + 1}
+                                        </span>
+                                        {choice.label}
+                                      </span>
+                                      <i className="fa-solid fa-angle-right text-slate-600 group-hover:text-indigo-400 transition text-[10px]"></i>
+                                    </button>
+                                  );
+                                })
+                              ) : (
+                                <button
+                                  onClick={() => evaluateAndGo(node.autoNextNodeId, playtestActiveFlags)}
+                                  className="w-full text-left bg-emerald-950/20 hover:bg-emerald-900/30 border border-emerald-800/40 rounded-xl p-3 text-xs text-emerald-300 flex items-center justify-between group transition"
+                                >
+                                  <span className="flex items-center gap-2">
+                                    <i className="fa-solid fa-forward text-emerald-400 animate-pulse text-[10px]"></i>
+                                    {node.hasOwnProperty("autoNextNodeId") && node.autoNextNodeId === null
+                                      ? "Conclude conversation thread interaction (null target)"
+                                      : "Advance timeline sequence block step automatically..."}
+                                  </span>
+                                  <i className="fa-solid fa-angles-right text-emerald-600 group-hover:text-emerald-400 transition text-[10px]"></i>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      <div className="text-center py-8 space-y-3">
+                        <div className="w-16 h-16 bg-slate-950 rounded-full flex items-center justify-center text-2xl mx-auto shadow-inner">
+                          {playtestNodeId === null || playtestNodeId === "null" ? (
+                            <i className="fa-solid fa-flag-checkered text-emerald-400"></i>
+                          ) : (
+                            <i className="fa-solid fa-triangle-exclamation text-rose-400"></i>
+                          )}
+                        </div>
+                        <div>
+                          <h4 className="text-sm font-bold text-slate-200">
+                            {playtestNodeId === null || playtestNodeId === "null"
+                              ? "Dialogue Sequence Safely Complete"
+                              : "Narrative Traversal Interrupted"}
+                          </h4>
+                          <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1 leading-relaxed">
+                            {playtestNodeId === null || playtestNodeId === "null"
+                              ? "The narrative pipeline hit a terminal null endpoint target. This signifies a clean, intentional closing sequence completion structurally."
+                              : `The story runtime system attempted to navigate to [${playtestNodeId}], which is missing or broken inside this tree design setup.`}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Active global simulation context monitor metrics row labels tracking parameters debugging status tools definitions */}
+                  <div className="px-5 py-3 bg-slate-950 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-500 font-mono shrink-0">
+                    <span className="truncate max-w-[60%]">
+                      Active Session Flags State: [{playtestActiveFlags.join(", ") || "none"}]
+                    </span>
+                    <button
+                      onClick={() => startPlaytest(playtestActiveFlags)}
+                      className="text-indigo-400 hover:text-indigo-300 font-bold flex items-center gap-1 bg-slate-900 border border-slate-800 px-2 py-1 rounded transition"
+                    >
+                      <i className="fa-solid fa-arrow-rotate-left text-[9px]"></i> Reset Engine Simulation Run
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      // Render target system components mounts layout tracking setups init bindings bootstrap systems launch sequences
+      const container = document.getElementById("root");
+      const root = ReactDOM.createRoot(container);
+      root.render(<App />);
+    </script>
+  </body>
+</html>
+
+```
